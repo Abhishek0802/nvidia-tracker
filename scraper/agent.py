@@ -66,17 +66,22 @@ def run(client: openai.OpenAI, url: str) -> str:
             fn = TOOL_MAP.get(tc.function.name)
             if fn:
                 args = json.loads(tc.function.arguments)
-                logger.info(f"Tool called: {tc.function.name}")
+                logger.info(f"[TOOL CALL]    tool={tc.function.name}  args={list(args.keys())}")
                 result = fn(**args)
+                logger.info(f"[TOOL RESULT]  tool={tc.function.name}  success={result.get('success', True)}")
             else:
-                logger.warning(
-                    f"BLOCKED: Agent 1 attempted '{tc.function.name}' "
-                    "— this tool is NOT permitted in the scraper container"
-                )
+                logger.warning("!" * 60)
+                logger.warning(f"[RESTRICTED ACTION BLOCKED]")
+                logger.warning(f"  Sandbox     : SCRAPER")
+                logger.warning(f"  Tool called : {tc.function.name}")
+                logger.warning(f"  Reason      : Tool is not permitted in this sandbox")
+                logger.warning(f"  Permitted   : scrape_stock_page")
+                logger.warning(f"  Action      : Request rejected, error returned to agent")
+                logger.warning("!" * 60)
                 result = {
                     "error": (
-                        f"BLOCKED: '{tc.function.name}' is not available in the "
-                        "scraper container. Only scrape_stock_page is permitted."
+                        f"BLOCKED: '{tc.function.name}' is not permitted in the scraper sandbox. "
+                        "Only scrape_stock_page is available here."
                     )
                 }
 

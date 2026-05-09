@@ -93,19 +93,25 @@ def run(client: openai.OpenAI, stock_data: str) -> str:
             fn = TOOL_MAP.get(tc.function.name)
             if fn:
                 args = json.loads(tc.function.arguments)
-                logger.info(f"Tool called: {tc.function.name}")
+                logger.info(f"[TOOL CALL]    tool={tc.function.name}  args={list(args.keys())}")
                 result = fn(**args)
                 if result.get("success"):
-                    logger.info(f"File saved → {result.get('path')}")
+                    logger.info(f"[TOOL RESULT]  tool={tc.function.name}  saved → {result.get('path')}")
+                else:
+                    logger.error(f"[TOOL RESULT]  tool={tc.function.name}  error={result.get('error')}")
             else:
-                logger.warning(
-                    f"BLOCKED: Agent 2 attempted '{tc.function.name}' "
-                    "— this tool is NOT permitted in the writer container"
-                )
+                logger.warning("!" * 60)
+                logger.warning(f"[RESTRICTED ACTION BLOCKED]")
+                logger.warning(f"  Sandbox     : WRITER")
+                logger.warning(f"  Tool called : {tc.function.name}")
+                logger.warning(f"  Reason      : Tool is not permitted in this sandbox")
+                logger.warning(f"  Permitted   : write_to_file")
+                logger.warning(f"  Action      : Request rejected, error returned to agent")
+                logger.warning("!" * 60)
                 result = {
                     "error": (
-                        f"BLOCKED: '{tc.function.name}' is not available in the "
-                        "writer container. Only write_to_file is permitted."
+                        f"BLOCKED: '{tc.function.name}' is not permitted in the writer sandbox. "
+                        "Only write_to_file is available here."
                     )
                 }
 
