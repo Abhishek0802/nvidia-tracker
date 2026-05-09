@@ -1,0 +1,16 @@
+# Environment
+.env
+venv/
+
+# Output & logs
+output/
+logs/
+nvidia_stock_*.txt
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
