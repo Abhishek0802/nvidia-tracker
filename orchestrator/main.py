@@ -1,82 +1,185 @@
 """
-Orchestrator — coordinates the scraper and writer containers.
-Runs once and exits. Communicates via HTTP only.
+Orchestrator — Daytona on-demand sandbox edition.
+
+Lifecycle per agent:
+  create sandbox → upload code → install deps → run agent → fetch output → delete sandbox
+
+No containers sit idle. Each sandbox exists only for the duration of its task.
 """
 
 import logging
 import os
 import sys
-import time
+from pathlib import Path
 
-import requests
+from dotenv import load_dotenv
+from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxParams
 
-SCRAPER_URL = os.environ.get("SCRAPER_URL", "http://scraper:8001")
-WRITER_URL = os.environ.get("WRITER_URL", "http://writer:8002")
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY", "")
 NVIDIA_URL = "https://www.moomoo.com/sg/articles/nvidia-share-price-prediction"
+OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-os.makedirs("/logs", exist_ok=True)
+os.makedirs(os.path.join(os.path.dirname(__file__), "..", "logs"), exist_ok=True)
+log_path = os.path.join(os.path.dirname(__file__), "..", "logs", "orchestrator.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [ORCHESTRATOR] %(levelname)s  %(message)s",
-    handlers=[
-        logging.FileHandler("/logs/orchestrator.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(log_path), logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("orchestrator")
 
 
-def wait_for_service(name: str, url: str, retries: int = 10, delay: int = 3) -> None:
-    for i in range(retries):
-        try:
-            r = requests.get(f"{url}/health", timeout=5)
-            if r.status_code == 200:
-                info = r.json()
-                logger.info(
-                    f"{name} is ready — container={info['container']} port={info['port']}"
-                )
-                return
-        except Exception:
-            pass
-        logger.info(f"Waiting for {name} ({i + 1}/{retries}) …")
-        time.sleep(delay)
-    logger.error(f"{name} did not become healthy in time")
-    sys.exit(1)
+def upload_dir(sandbox, local_dir: str, remote_dir: str = "/home/user") -> None:
+    for f in Path(local_dir).glob("*.py"):
+        content = f.read_bytes()
+        sandbox.fs.upload_file(content, f"{remote_dir}/{f.name}")
+        logger.info(f"  Uploaded {f.name} → {remote_dir}/{f.name}")
 
+
+# ── Agent 1 — Scraper sandbox ─────────────────────────────────────────────────
+
+_SCRAPER_DRIVER = f"""
+import sys, os, logging
+sys.path.insert(0, '/home/user')
+logging.basicConfig(level=logging.INFO, format='[SCRAPER] %(message)s')
+
+from agent import run
+import openai
+
+client = openai.OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+result = run(client, '{NVIDIA_URL}')
+print(result)
+"""
+
+
+def run_scraper(daytona: Daytona) -> str:
+    logger.info("=" * 50)
+    logger.info("Creating SCRAPER sandbox (on-demand)")
+
+    sandbox = daytona.create(
+        CreateSandboxParams(
+            language="python",
+            env_vars={"OPENAI_API_KEY": OPENAI_API_KEY},
+            auto_stop_interval=0,
+        )
+    )
+    logger.info(f"Scraper sandbox created — id={sandbox.id}")
+    logger.info("Permitted : scrape_stock_page | Forbidden : write_to_file")
+
+    try:
+        logger.info("Uploading scraper code …")
+        upload_dir(sandbox, str(Path(__file__).parent.parent / "scraper"))
+
+        logger.info("Installing dependencies …")
+        sandbox.process.exec("pip install openai requests beautifulsoup4 -q")
+
+        logger.info("Running Agent 1 …")
+        response = sandbox.process.code_run(_SCRAPER_DRIVER)
+        logger.info("Agent 1 finished — stock data received")
+        return response.result
+
+    finally:
+        logger.info(f"Deleting scraper sandbox {sandbox.id} …")
+        daytona.delete(sandbox)
+        logger.info("Scraper sandbox deleted")
+        logger.info("=" * 50)
+
+
+# ── Agent 2 — Writer sandbox ──────────────────────────────────────────────────
+
+_WRITER_DRIVER = """
+import sys, os, logging
+sys.path.insert(0, '/home/user')
+logging.basicConfig(level=logging.INFO, format='[WRITER] %(message)s')
+
+os.environ['OUTPUT_DIR'] = '/home/user/output'
+
+from agent import run
+import openai
+
+client = openai.OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+
+with open('/home/user/stock_data.txt', encoding='utf-8') as f:
+    stock_data = f.read()
+
+result = run(client, stock_data)
+print(result)
+"""
+
+
+def run_writer(daytona: Daytona, stock_data: str) -> str:
+    logger.info("=" * 50)
+    logger.info("Creating WRITER sandbox (on-demand)")
+
+    sandbox = daytona.create(
+        CreateSandboxParams(
+            language="python",
+            env_vars={"OPENAI_API_KEY": OPENAI_API_KEY},
+            auto_stop_interval=0,
+        )
+    )
+    logger.info(f"Writer sandbox created — id={sandbox.id}")
+    logger.info("Permitted : write_to_file | Forbidden : scrape_stock_page")
+
+    try:
+        logger.info("Uploading writer code …")
+        upload_dir(sandbox, str(Path(__file__).parent.parent / "writer"))
+
+        logger.info("Uploading stock data …")
+        sandbox.fs.upload_file(stock_data.encode("utf-8"), "/home/user/stock_data.txt")
+
+        logger.info("Installing dependencies …")
+        sandbox.process.exec("pip install openai -q")
+
+        logger.info("Running Agent 2 …")
+        sandbox.process.exec("mkdir -p /home/user/output")
+        response = sandbox.process.code_run(_WRITER_DRIVER)
+
+        # Download the saved report back to local output/
+        files_resp = sandbox.process.exec("ls /home/user/output/")
+        filenames = [f.strip() for f in files_resp.result.strip().splitlines() if f.strip()]
+
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        for filename in filenames:
+            content = sandbox.fs.download_file(f"/home/user/output/{filename}")
+            local_path = os.path.join(OUTPUT_DIR, filename)
+            with open(local_path, "wb") as fh:
+                fh.write(content)
+            logger.info(f"Report downloaded → {local_path}")
+
+        logger.info("Agent 2 finished — report saved")
+        return response.result
+
+    finally:
+        logger.info(f"Deleting writer sandbox {sandbox.id} …")
+        daytona.delete(sandbox)
+        logger.info("Writer sandbox deleted")
+        logger.info("=" * 50)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    logger.info("=" * 60)
-    logger.info("Orchestrator starting")
-    logger.info(f"  Scraper service : {SCRAPER_URL}")
-    logger.info(f"  Writer  service : {WRITER_URL}")
-    logger.info("=" * 60)
+    if not OPENAI_API_KEY:
+        sys.exit("Error: OPENAI_API_KEY is not set in .env")
+    if not DAYTONA_API_KEY:
+        sys.exit("Error: DAYTONA_API_KEY is not set in .env")
 
-    wait_for_service("Scraper", SCRAPER_URL)
-    wait_for_service("Writer", WRITER_URL)
-
-    # ── Step 1: Scraper ───────────────────────────────────────────────────────
-    logger.info(f"Calling scraper → POST {SCRAPER_URL}/scrape")
-    resp = requests.post(
-        f"{SCRAPER_URL}/scrape", json={"url": NVIDIA_URL}, timeout=120
-    )
-    resp.raise_for_status()
-    stock_data = resp.json()["data"]
-    logger.info("Scraper returned data successfully")
-
-    # ── Step 2: Writer ────────────────────────────────────────────────────────
-    logger.info(f"Calling writer  → POST {WRITER_URL}/write")
-    resp = requests.post(
-        f"{WRITER_URL}/write", json={"stock_data": stock_data}, timeout=120
-    )
-    resp.raise_for_status()
-    confirmation = resp.json()["confirmation"]
-    logger.info("Writer saved report successfully")
+    daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
 
     logger.info("=" * 60)
+    logger.info("NVIDIA Stock Tracker — Daytona On-Demand Sandboxes")
+    logger.info("=" * 60)
+
+    stock_data = run_scraper(daytona)
+    confirmation = run_writer(daytona, stock_data)
+
     logger.info("Pipeline complete")
     logger.info(confirmation)
-    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
