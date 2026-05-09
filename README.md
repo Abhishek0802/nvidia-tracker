@@ -1,6 +1,6 @@
-# NVIDIA Stock Tracker — Two-Agent Docker Pipeline
+# NVIDIA Stock Tracker — Daytona On-Demand Sandbox Pipeline
 
-An AI-powered stock tracker that uses two isolated GPT-4o agents running in separate Docker containers to scrape, format, and save NVIDIA stock data.
+An AI-powered stock tracker that uses two GPT-4o agents running in isolated **Daytona on-demand sandboxes** to scrape, format, and save NVIDIA stock data. Each sandbox is created when needed and deleted immediately after — zero idle resources.
 
 ---
 
@@ -8,29 +8,40 @@ An AI-powered stock tracker that uses two isolated GPT-4o agents running in sepa
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Orchestrator                         │
-│              coordinates Agent 1 → Agent 2                  │
+│            Orchestrator (Docker Container)                  │
+│         runs as a container, coordinates agents             │
 └────────────────┬────────────────────┬───────────────────────┘
                  │                    │
                  ▼                    ▼
 ┌───────────────────────┐  ┌───────────────────────┐
 │   Scraper (Agent 1)   │  │   Writer  (Agent 2)   │
-│       Port 8001       │  │       Port 8002       │
+│  Daytona Sandbox      │  │  Daytona Sandbox       │
+│  (created on-demand)  │  │  (created on-demand)   │
 │                       │  │                       │
 │  ✅ scrape_stock_page  │  │  ✅ write_to_file      │
 │  ❌ write_to_file      │  │  ❌ scrape_stock_page  │
-│  🔒 read-only fs       │  │  📁 writes to /output  │
-│  🌐 public-net         │  │  🔒 tool-level block   │
+│                       │  │                       │
+│  Created → Run → ❌   │  │  Created → Run → ❌   │
 └───────────────────────┘  └───────────────────────┘
 ```
 
+### How On-Demand Sandboxes Work
+
+Each agent sandbox:
+1. **Created** — Daytona spins up an isolated Python environment
+2. **Loaded** — orchestrator uploads the agent code and installs dependencies
+3. **Executed** — agent runs, scrapes or writes the report
+4. **Deleted** — sandbox is destroyed immediately after
+
+No containers sit idle. Each sandbox exists only for the duration of its task.
+
 ### Isolation Model
 
-| | Scraper (8001) | Writer (8002) |
+| | Scraper Sandbox | Writer Sandbox |
 |---|---|---|
-| Scrape URLs | ✅ Permitted | ❌ Blocked (not in tool schema) |
-| Write files | ❌ Blocked (read-only filesystem) | ✅ Permitted |
-| Network | `public-net` + `internal-net` | `public-net` + `internal-net` |
+| Scrape URLs | ✅ Permitted | ❌ Not in tool schema |
+| Write files | ❌ Not in tool schema | ✅ Permitted (`/home/user/output`) |
+| Lifecycle | On-demand, auto-deleted | On-demand, auto-deleted |
 
 ---
 
@@ -39,26 +50,40 @@ An AI-powered stock tracker that uses two isolated GPT-4o agents running in sepa
 ```
 nvidia-tracker/
 ├── scraper/                # Agent 1 — scrapes stock data
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── server.py           # FastAPI server on port 8001
-│   ├── agent.py            # GPT-4o tool-use loop
+│   ├── agent.py            # GPT-4o tool-use loop (uploaded to sandbox)
 │   └── tools.py            # scrape_stock_page
 ├── writer/                 # Agent 2 — formats and saves report
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── server.py           # FastAPI server on port 8002
-│   ├── agent.py            # GPT-4o tool-use loop
+│   ├── agent.py            # GPT-4o tool-use loop (uploaded to sandbox)
 │   └── tools.py            # write_to_file
-├── orchestrator/           # Coordinates the two agents
+├── orchestrator/           # Runs as a Docker container
 │   ├── Dockerfile
+│   ├── entrypoint.sh       # DNS setup for Daytona proxy resolution
 │   ├── requirements.txt
-│   └── main.py
+│   └── main.py             # Creates/runs/deletes Daytona sandboxes
 ├── docker-compose.yml
-├── .env                    # Your API key (not committed)
-├── logs/                   # Per-container log files
+├── .env                    # API keys (not committed)
+├── logs/                   # Orchestrator logs
 └── output/                 # Saved stock reports
 ```
+
+---
+
+## Prerequisites
+
+### 1. Start Daytona OSS locally
+
+```bash
+git clone https://github.com/daytonaio/daytona
+cd daytona
+docker compose -f docker/docker-compose.yaml up -d
+```
+
+Dashboard available at `http://localhost:3000`
+Login: `dev@daytona.io` / `password`
+
+### 2. Get a Daytona API key
+
+Go to `http://localhost:3000` → Settings → API Keys → Create new key
 
 ---
 
@@ -71,10 +96,12 @@ git clone https://github.com/Abhishek0802/nvidia-tracker.git
 cd nvidia-tracker
 ```
 
-### 2. Add your OpenAI API key
+### 2. Configure `.env`
 
 ```bash
-echo "OPENAI_API_KEY=sk-..." > .env
+OPENAI_API_KEY=sk-...
+DAYTONA_API_KEY=dtn_...
+DAYTONA_API_URL=http://localhost:3000/api
 ```
 
 ### 3. Build
@@ -86,44 +113,39 @@ docker compose build
 ### 4. Run
 
 ```bash
-docker compose up --abort-on-container-exit
+docker compose up
 ```
 
-The report is saved to the `output/` folder when the pipeline completes.
+The report is saved to `output/` when the pipeline completes.
 
 ---
 
 ## Logs
 
-Each container writes its own log file to the `logs/` folder:
-
-| File | Container |
-|---|---|
-| `logs/scraper.log` | Agent 1 — scraping activity |
-| `logs/writer.log` | Agent 2 — file writing activity |
-| `logs/orchestrator.log` | Pipeline flow |
-
-Watch live during a run:
-
 ```bash
-tail -f logs/scraper.log logs/writer.log logs/orchestrator.log
+tail -f logs/orchestrator.log
 ```
 
 ---
 
 ## How It Works
 
-1. **Orchestrator** starts and waits for both agents to pass health checks
-2. **Scraper (Agent 1)** receives the Moomoo NVIDIA page URL, calls `scrape_stock_page`, and returns a structured plain-text report
-3. **Orchestrator** passes the report to the Writer
-4. **Writer (Agent 2)** formats the data into a polished report and calls `write_to_file` to save it
-5. Both containers are blocked from performing the other's job — enforced at the tool schema and filesystem level
+1. **Orchestrator** container starts, configures DNS to resolve Daytona sandbox hostnames
+2. **Scraper sandbox** is created on-demand in Daytona
+   - `scraper/agent.py` and `scraper/tools.py` are uploaded into it
+   - Agent 1 scrapes the Moomoo NVIDIA page and returns structured data
+   - Sandbox is deleted
+3. **Writer sandbox** is created on-demand in Daytona
+   - `writer/agent.py` and `writer/tools.py` are uploaded into it
+   - Agent 2 formats the data into a polished report and saves it
+   - Report is downloaded to local `output/`
+   - Sandbox is deleted
 
 ---
 
 ## Tech Stack
 
 - [OpenAI GPT-4o](https://platform.openai.com/) — agent reasoning and tool use
-- [FastAPI](https://fastapi.tiangolo.com/) — HTTP layer between containers
-- [Docker Compose](https://docs.docker.com/compose/) — multi-container orchestration
+- [Daytona OSS](https://github.com/daytonaio/daytona) — on-demand sandbox execution
+- [Docker Compose](https://docs.docker.com/compose/) — orchestrator container
 - [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — HTML parsing

@@ -1,83 +1,27 @@
 version: "3.9"
 
-# ── Networks ──────────────────────────────────────────────────────────────────
-# public-net  : has internet access (scraper only)
-# internal-net: no internet — all inter-service communication happens here
 networks:
-  public-net: {}
-  internal-net:
-    internal: true   # Docker blocks all external traffic on this network
-
-# ── Volumes ───────────────────────────────────────────────────────────────────
-volumes:
-  logs:
-  output:
+  # Join Daytona's network so the orchestrator can reach sandbox containers
+  daytona-net:
+    external: true
+    name: daytona_daytona-network
 
 services:
 
-  # ── Scraper (Agent 1) ───────────────────────────────────────────────────────
-  # CAN  : scrape URLs (public-net)
-  # CANNOT: write files (read_only: true)
-  scraper:
-    build: ./scraper
-    ports:
-      - "8001:8001"
-    networks:
-      - public-net      # internet access for scraping
-      - internal-net    # receives requests from orchestrator
-    volumes:
-      - ./logs:/logs    # log output only — no output dir
-    env_file: .env
-    read_only: true     # filesystem is read-only — cannot write reports
-    tmpfs:
-      - /tmp            # allow Python/uvicorn temp files
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
-  # ── Writer (Agent 2) ────────────────────────────────────────────────────────
-  # CAN  : write files to /app/output, call OpenAI API
-  # CANNOT: call scrape_stock_page (tool not in schema) | write blocked on scraper (read-only fs)
-  writer:
-    build: ./writer
-    ports:
-      - "8002:8002"
-    networks:
-      - public-net      # needs OpenAI API access
-      - internal-net    # receives requests from orchestrator
-    volumes:
-      - ./output:/app/output   # write reports here
-      - ./logs:/logs
-    env_file: .env
-    environment:
-      - OUTPUT_DIR=/app/output
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
-  # ── Orchestrator ─────────────────────────────────────────────────────────────
-  # Calls scraper → passes data → calls writer. Runs once and exits.
+  # Orchestrator runs as a container.
+  # Scraper and Writer agents run as on-demand Daytona sandboxes — no containers here.
   orchestrator:
-    build: ./orchestrator
+    build:
+      context: .                        # root so we can COPY scraper/ and writer/
+      dockerfile: orchestrator/Dockerfile
     networks:
-      - internal-net    # talks to scraper and writer via internal network
+      - daytona-net                     # same network as Daytona sandboxes
     volumes:
-      - ./logs:/logs
+      - ./output:/app/output            # reports land here
+      - ./logs:/logs                    # orchestrator logs
     env_file: .env
     environment:
-      - SCRAPER_URL=http://scraper:8001
-      - WRITER_URL=http://writer:8002
-    depends_on:
-      scraper:
-        condition: service_healthy
-      writer:
-        condition: service_healthy
-    restart: "no"       # run once and exit
+      - DAYTONA_API_URL=http://api:3000/api   # api = Daytona API container hostname
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"

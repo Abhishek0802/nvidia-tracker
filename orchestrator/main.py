@@ -13,18 +13,18 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxParams
+from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxFromImageParams
 
 load_dotenv()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 DAYTONA_API_KEY = os.environ.get("DAYTONA_API_KEY", "")
 NVIDIA_URL = "https://www.moomoo.com/sg/articles/nvidia-share-price-prediction"
-OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "output"))
+OUTPUT_DIR = "/app/output"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-os.makedirs(os.path.join(os.path.dirname(__file__), "..", "logs"), exist_ok=True)
-log_path = os.path.join(os.path.dirname(__file__), "..", "logs", "orchestrator.log")
+os.makedirs("/logs", exist_ok=True)
+log_path = "/logs/orchestrator.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [ORCHESTRATOR] %(levelname)s  %(message)s",
@@ -61,8 +61,8 @@ def run_scraper(daytona: Daytona) -> str:
     logger.info("Creating SCRAPER sandbox (on-demand)")
 
     sandbox = daytona.create(
-        CreateSandboxParams(
-            language="python",
+        CreateSandboxFromImageParams(
+            image="python:3.12",
             env_vars={"OPENAI_API_KEY": OPENAI_API_KEY},
             auto_stop_interval=0,
         )
@@ -72,7 +72,7 @@ def run_scraper(daytona: Daytona) -> str:
 
     try:
         logger.info("Uploading scraper code …")
-        upload_dir(sandbox, str(Path(__file__).parent.parent / "scraper"))
+        upload_dir(sandbox, str(Path(__file__).parent / "scraper"))
 
         logger.info("Installing dependencies …")
         sandbox.process.exec("pip install openai requests beautifulsoup4 -q")
@@ -116,8 +116,8 @@ def run_writer(daytona: Daytona, stock_data: str) -> str:
     logger.info("Creating WRITER sandbox (on-demand)")
 
     sandbox = daytona.create(
-        CreateSandboxParams(
-            language="python",
+        CreateSandboxFromImageParams(
+            image="python:3.12",
             env_vars={"OPENAI_API_KEY": OPENAI_API_KEY},
             auto_stop_interval=0,
         )
@@ -127,7 +127,7 @@ def run_writer(daytona: Daytona, stock_data: str) -> str:
 
     try:
         logger.info("Uploading writer code …")
-        upload_dir(sandbox, str(Path(__file__).parent.parent / "writer"))
+        upload_dir(sandbox, str(Path(__file__).parent / "writer"))
 
         logger.info("Uploading stock data …")
         sandbox.fs.upload_file(stock_data.encode("utf-8"), "/home/user/stock_data.txt")
@@ -169,7 +169,10 @@ def main() -> None:
     if not DAYTONA_API_KEY:
         sys.exit("Error: DAYTONA_API_KEY is not set in .env")
 
-    daytona = Daytona(DaytonaConfig(api_key=DAYTONA_API_KEY))
+    daytona = Daytona(DaytonaConfig(
+        api_key=DAYTONA_API_KEY,
+        api_url=os.environ.get("DAYTONA_API_URL", "http://localhost:3000"),
+    ))
 
     logger.info("=" * 60)
     logger.info("NVIDIA Stock Tracker — Daytona On-Demand Sandboxes")
