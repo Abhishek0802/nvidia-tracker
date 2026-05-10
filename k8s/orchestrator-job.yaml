@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nvidia-orchestrator
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: orchestrator
+          image: nvidiatrackeracr.azurecr.io/orchestrator:latest
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nvidia-tracker-secrets
+                  key: openai-api-key
+            - name: DAYTONA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nvidia-tracker-secrets
+                  key: daytona-api-key
+            - name: DAYTONA_API_URL
+              value: "http://api:3000/api"
+          volumeMounts:
+            - name: output
+              mountPath: /app/output
+            - name: logs
+              mountPath: /logs
+      volumes:
+        - name: output
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
