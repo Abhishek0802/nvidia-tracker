@@ -1,151 +1,136 @@
-# NVIDIA Stock Tracker — Daytona On-Demand Sandbox Pipeline
+# NVIDIA Stock Tracker
 
-An AI-powered stock tracker that uses two GPT-4o agents running in isolated **Daytona on-demand sandboxes** to scrape, format, and save NVIDIA stock data. Each sandbox is created when needed and deleted immediately after — zero idle resources.
+An AI-powered pipeline that scrapes NVIDIA stock data and produces a formatted report. Two GPT-4o agents run in isolated **OpenSandbox on-demand containers** on Azure Kubernetes Service. Each sandbox is created for its task and deleted immediately after — no idle resources.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│            Orchestrator (Docker Container)                  │
-│         runs as a container, coordinates agents             │
-└────────────────┬────────────────────┬───────────────────────┘
-                 │                    │
-                 ▼                    ▼
-┌───────────────────────┐  ┌───────────────────────┐
-│   Scraper (Agent 1)   │  │   Writer  (Agent 2)   │
-│  Daytona Sandbox      │  │  Daytona Sandbox       │
-│  (created on-demand)  │  │  (created on-demand)   │
-│                       │  │                       │
-│  ✅ scrape_stock_page  │  │  ✅ write_to_file      │
-│  ❌ write_to_file      │  │  ❌ scrape_stock_page  │
-│                       │  │                       │
-│  Created → Run → ❌   │  │  Created → Run → ❌   │
-└───────────────────────┘  └───────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                  AKS — nvidia-tracker namespace                 │
+│                                                                 │
+│  ┌──────────────────────┐   ┌──────────────────────────────┐   │
+│  │  Orchestrator (Job)  │──▶│  OpenSandbox Server          │   │
+│  │  orchestrator:latest │   │  (Docker-in-Docker sidecar)  │   │
+│  └──────────────────────┘   └──────────────────────────────┘   │
+│           │                          │                          │
+│           │         creates / runs / deletes                    │
+│           │                          │                          │
+│           │         ┌────────────────┴────────────────┐        │
+│           │         ▼                                 ▼        │
+│           │  ┌─────────────────┐         ┌──────────────────┐  │
+│           │  │ Scraper Sandbox │         │  Writer Sandbox  │  │
+│           │  │  python:3.12    │         │   python:3.12    │  │
+│           │  │                 │         │                  │  │
+│           │  │ scrape_stock    │         │  write_to_file   │  │
+│           │  │ _page only      │         │  only            │  │
+│           │  │                 │         │                  │  │
+│           │  │ Create→Run→Del  │         │  Create→Run→Del  │  │
+│           └─▶└─────────────────┘         └──────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    ACR: nvidiatrackeracr
 ```
 
-### How On-Demand Sandboxes Work
+### Pipeline
 
-Each agent sandbox:
-1. **Created** — Daytona spins up an isolated Python environment
-2. **Loaded** — orchestrator uploads the agent code and installs dependencies
-3. **Executed** — agent runs, scrapes or writes the report
-4. **Deleted** — sandbox is destroyed immediately after
+1. **Orchestrator** starts and calls the OpenSandbox API to create a Scraper sandbox
+2. **Scraper sandbox** spins up — `scraper/agent.py` and `scraper/tools.py` are uploaded, dependencies installed, Agent 1 runs and scrapes the NVIDIA stock page, sandbox is deleted
+3. **Writer sandbox** spins up — `writer/agent.py` and `writer/tools.py` are uploaded along with the scraped data, Agent 2 formats and saves a report, the report is downloaded to the orchestrator, sandbox is deleted
 
-No containers sit idle. Each sandbox exists only for the duration of its task.
+### Isolation model
 
-### Isolation Model
-
-| | Scraper Sandbox | Writer Sandbox |
+| | Scraper sandbox | Writer sandbox |
 |---|---|---|
-| Scrape URLs | ✅ Permitted | ❌ Not in tool schema |
-| Write files | ❌ Not in tool schema | ✅ Permitted (`/home/user/output`) |
-| Lifecycle | On-demand, auto-deleted | On-demand, auto-deleted |
+| Permitted tool | `scrape_stock_page` | `write_to_file` |
+| Blocked tool | `write_to_file` (not in schema) | `scrape_stock_page` (not in schema) |
+| Lifecycle | Created → Run → Deleted | Created → Run → Deleted |
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 nvidia-tracker/
-├── scraper/                # Agent 1 — scrapes stock data
-│   ├── agent.py            # GPT-4o tool-use loop (uploaded to sandbox)
-│   └── tools.py            # scrape_stock_page
-├── writer/                 # Agent 2 — formats and saves report
-│   ├── agent.py            # GPT-4o tool-use loop (uploaded to sandbox)
-│   └── tools.py            # write_to_file
-├── orchestrator/           # Runs as a Docker container
+├── orchestrator/
+│   ├── main.py             # Creates/runs/deletes OpenSandbox sandboxes
 │   ├── Dockerfile
-│   ├── entrypoint.sh       # DNS setup for Daytona proxy resolution
-│   ├── requirements.txt
-│   └── main.py             # Creates/runs/deletes Daytona sandboxes
-├── docker-compose.yml
-├── .env                    # API keys (not committed)
-├── logs/                   # Orchestrator logs
-└── output/                 # Saved stock reports
+│   └── requirements.txt
+├── scraper/
+│   ├── agent.py            # GPT-4o tool-use loop (uploaded into sandbox)
+│   └── tools.py            # scrape_stock_page
+├── writer/
+│   ├── agent.py            # GPT-4o tool-use loop (uploaded into sandbox)
+│   └── tools.py            # write_to_file
+├── k8s/
+│   ├── opensandbox-server.yaml   # OpenSandbox server + DinD Deployment & Service
+│   ├── orchestrator-job.yaml     # Orchestrator K8s Job
+│   └── deploy.sh                 # End-to-end Azure deployment script
+└── output/                 # Stock reports land here
 ```
 
 ---
 
 ## Prerequisites
 
-### 1. Start Daytona OSS locally
-
-```bash
-git clone https://github.com/daytonaio/daytona
-cd daytona
-docker compose -f docker/docker-compose.yaml up -d
-```
-
-Dashboard available at `http://localhost:3000`
-Login: `dev@daytona.io` / `password`
-
-### 2. Get a Daytona API key
-
-Go to `http://localhost:3000` → Settings → API Keys → Create new key
+- Azure CLI (`az`) — logged in with `az login`
+- `kubectl`
+- An OpenAI API key
 
 ---
 
-## Quickstart
-
-### 1. Clone the repo
+## Deploy to Azure
 
 ```bash
-git clone https://github.com/Abhishek0802/nvidia-tracker.git
-cd nvidia-tracker
+export OPENAI_API_KEY=sk-...
+
+# Optional — override these if your Azure resources have different names
+export RESOURCE_GROUP=nvidia-tracker-rg
+export AKS_CLUSTER=nvidia-tracker-aks
+export ACR_NAME=nvidiatrackeracr
+
+./k8s/deploy.sh
 ```
 
-### 2. Configure `.env`
+The script handles everything in order:
+
+| Step | What happens |
+|---|---|
+| 1 | Fetches AKS credentials |
+| 2 | Creates the `nvidia-tracker` namespace |
+| 3 | Creates the ACR image-pull secret |
+| 4 | Stores the OpenAI key as a K8s secret |
+| 5 | Builds and pushes the orchestrator image via ACR Tasks |
+| 6 | Deploys the OpenSandbox server and waits for it to be ready |
+| 7 | Submits the orchestrator Job and tails logs |
+
+### Run it again
 
 ```bash
-OPENAI_API_KEY=sk-...
-DAYTONA_API_KEY=dtn_...
-DAYTONA_API_URL=http://localhost:3000/api
-```
-
-### 3. Build
-
-```bash
-docker compose build
-```
-
-### 4. Run
-
-```bash
-docker compose up
-```
-
-The report is saved to `output/` when the pipeline completes.
-
----
-
-## Logs
-
-```bash
-tail -f logs/orchestrator.log
+kubectl delete job nvidia-orchestrator -n nvidia-tracker --ignore-not-found
+kubectl apply -f k8s/orchestrator-job.yaml
+kubectl logs -n nvidia-tracker -l job-name=nvidia-orchestrator --follow
 ```
 
 ---
 
-## How It Works
+## Azure resources
 
-1. **Orchestrator** container starts, configures DNS to resolve Daytona sandbox hostnames
-2. **Scraper sandbox** is created on-demand in Daytona
-   - `scraper/agent.py` and `scraper/tools.py` are uploaded into it
-   - Agent 1 scrapes the Moomoo NVIDIA page and returns structured data
-   - Sandbox is deleted
-3. **Writer sandbox** is created on-demand in Daytona
-   - `writer/agent.py` and `writer/tools.py` are uploaded into it
-   - Agent 2 formats the data into a polished report and saves it
-   - Report is downloaded to local `output/`
-   - Sandbox is deleted
+| Resource | Name | Notes |
+|---|---|---|
+| Resource group | `nvidia-tracker-rg` | East US |
+| Container registry | `nvidiatrackeracr` | Basic SKU, attached to AKS via managed identity |
+| Kubernetes cluster | `nvidia-tracker-aks` | 2× Standard_B2s nodes, K8s 1.34 |
+| Namespace | `nvidia-tracker` | All workloads live here |
 
 ---
 
-## Tech Stack
+## Tech stack
 
 - [OpenAI GPT-4o](https://platform.openai.com/) — agent reasoning and tool use
-- [Daytona OSS](https://github.com/daytonaio/daytona) — on-demand sandbox execution
-- [Docker Compose](https://docs.docker.com/compose/) — orchestrator container
+- [OpenSandbox](https://github.com/alibaba/OpenSandbox) — on-demand sandbox execution
+- [Azure Kubernetes Service](https://azure.microsoft.com/en-us/products/kubernetes-service) — cluster hosting
+- [Azure Container Registry](https://azure.microsoft.com/en-us/products/container-registry) — image storage
+- [Docker-in-Docker](https://hub.docker.com/_/docker) — Docker runtime inside AKS (containerd nodes have no host socket)
 - [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — HTML parsing

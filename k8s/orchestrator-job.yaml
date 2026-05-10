@@ -2,6 +2,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: nvidia-orchestrator
+  namespace: nvidia-tracker
 spec:
   ttlSecondsAfterFinished: 300
   template:
@@ -16,13 +17,16 @@ spec:
                 secretKeyRef:
                   name: nvidia-tracker-secrets
                   key: openai-api-key
-            - name: DAYTONA_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: nvidia-tracker-secrets
-                  key: daytona-api-key
-            - name: DAYTONA_API_URL
-              value: "http://api:3000/api"
+            # OpenSandbox server — ClusterIP Service in the same namespace
+            # OPEN_SANDBOX_DOMAIN is the native env var the opensandbox SDK reads
+            - name: OPEN_SANDBOX_DOMAIN
+              value: "opensandbox-server:8080"
+            # Optional: uncomment if you set server.api_key in the OpenSandbox TOML
+            # - name: SANDBOX_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: nvidia-tracker-secrets
+            #       key: sandbox-api-key
           volumeMounts:
             - name: output
               mountPath: /app/output

@@ -1,0 +1,142 @@
+# OpenSandbox server + Docker-in-Docker (DinD) sidecar
+# AKS uses containerd, so there is no host Docker socket — DinD provides one.
+#
+# Pod layout:
+#   docker-dind          — privileged Docker daemon, TCP on localhost:2375 (no TLS)
+#   opensandbox-server   — OpenSandbox API server, talks to dind via DOCKER_HOST
+#
+# The orchestrator Job resolves this Service as "opensandbox-server:8080".
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensandbox-config
+  namespace: nvidia-tracker
+data:
+  config.toml: |
+    [server]
+    host = "0.0.0.0"
+    port = 8080
+    max_sandbox_timeout_seconds = 86400
+
+    [log]
+    level = "INFO"
+
+    [runtime]
+    type = "docker"
+    execd_image = "opensandbox/execd:v1.0.15"
+
+    [store]
+    type = "sqlite"
+    path = "/tmp/opensandbox.db"
+
+    [docker]
+    network_mode = "bridge"
+    drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+    no_new_privileges = true
+    pids_limit = 4096
+
+    [ingress]
+    mode = "direct"
+
+    [egress]
+    image = "opensandbox/egress:v1.0.10"
+    mode = "dns"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensandbox-server
+  namespace: nvidia-tracker
+  labels:
+    app: opensandbox-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opensandbox-server
+  template:
+    metadata:
+      labels:
+        app: opensandbox-server
+    spec:
+      containers:
+
+        # ── Docker-in-Docker daemon ───────────────────────────────────────────
+        - name: docker-dind
+          image: docker:24-dind
+          securityContext:
+            privileged: true   # required for DinD
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""        # disable TLS so opensandbox-server can connect on plain TCP
+          args: ["--host=tcp://0.0.0.0:2375"]
+          ports:
+            - containerPort: 2375
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+
+        # ── OpenSandbox server ────────────────────────────────────────────────
+        - name: opensandbox-server
+          image: opensandbox/server:latest
+          env:
+            - name: SANDBOX_CONFIG_PATH
+              value: /etc/opensandbox/config.toml
+            # Point Docker SDK at the DinD daemon in the same pod
+            - name: DOCKER_HOST
+              value: tcp://localhost:2375
+            # Required in non-interactive mode when no api_key is set
+            - name: OPENSANDBOX_INSECURE_SERVER
+              value: "YES"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: opensandbox-config
+              mountPath: /etc/opensandbox
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+      volumes:
+        - name: opensandbox-config
+          configMap:
+            name: opensandbox-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensandbox-server
+  namespace: nvidia-tracker
+spec:
+  selector:
+    app: opensandbox-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
